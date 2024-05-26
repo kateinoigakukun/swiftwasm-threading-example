@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+set -eo pipefail
 
 if [ -z "$USE_SWIFT_SDK_ID" ]; then
   exec "$(dirname "$0")/use-swift.sh" $0 "$@"
@@ -34,6 +35,9 @@ if [ $DEPLOY -eq 1 ]; then
 else
   cp .build/release/MyApp.wasm static/MyApp.wasm
 fi
+
+echo "Generating metadata for WebAssembly memory size..."
+swift run --package-path ./Tools Tools ./static/MyApp.wasm static/wasm.meta.json
 
 PATH_TO_COPY=(
   JavaScriptKit_JavaScriptKit.resources/Runtime/index.mjs
