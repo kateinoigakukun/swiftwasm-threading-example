@@ -224,11 +224,21 @@ install-swift-toolchain() {
       *.pkg)
         installer -pkg $package_path -target CurrentUserHomeDirectory
         ln -s "$HOME/Library/Developer/Toolchains/swift-$version.xctoolchain" "$SWIFT_TOOLCHAIN_DIR"
+
+        # WORKAROUND: Strip hardened runtime flag from Swift binaries
+        # See https://github.com/apple/swift/issues/73327#issuecomment-2120481479
+        echo "Stripping hardened runtime flag from Swift binaries..."
+        find "$SWIFT_TOOLCHAIN_DIR/usr/bin" -type f | \
+          while read line; do
+            codesign --force --preserve-metadata=identifier,entitlements --sign - $line 2>/dev/null || true
+          done
         ;;
       *)
         fatal "Unsupported package format: $package_name"
         ;;
     esac
+
+    update-latest-swift-toolchain "$SWIFT_VERSION"
   else
     fatal "Failed to download Swift toolchain from $url"
   fi
@@ -237,6 +247,7 @@ install-swift-toolchain() {
 # Update symlink to the latest installed Swift toolchain
 update-latest-swift-toolchain() {
   local SWIFT_TOOLCHAIN_DIR=$(swift-toolchain-install-dir "$1")
+  rm -f "$INITIAL_PWD/Toolchains/swift-latest"
   ln -sf "$SWIFT_TOOLCHAIN_DIR" "$INITIAL_PWD/Toolchains/swift-latest"
 }
 
@@ -244,30 +255,42 @@ update-latest-swift-toolchain() {
 execute-with-swift-toolchain-path() {
   local SWIFT_TOOLCHAIN_DIR=$(swift-toolchain-install-dir "$1")
   shift
-  info "Setting PATH to $SWIFT_TOOLCHAIN_DIR/usr/bin"
-  env PATH="$SWIFT_TOOLCHAIN_DIR/usr/bin:$PATH" \
-    USE_SWIFT_TOOLCHAIN_DIR="$SWIFT_TOOLCHAIN_DIR" \
-    USE_SWIFT_SDK_ID="$(get-swift-sdk-id-from-manifest)" "$@"
+  local env_vars=()
+  env_vars+=("PATH=$SWIFT_TOOLCHAIN_DIR/usr/bin:$PATH")
+  env_vars+=("USE_SWIFT_TOOLCHAIN_DIR=$SWIFT_TOOLCHAIN_DIR")
+  env_vars+=("USE_SWIFT_SDK_ID=$(get-swift-sdk-id-from-manifest)")
+
+  # WORKAROUND: The latest Swift toolchain from the main branch has an issue
+  # with OS-bundled Swift runtime libraries on macOS.
+  # See https://github.com/apple/swift/issues/73327#issuecomment-2120481479
+  if [ "$(uname -s)" == "Darwin" ]; then
+    local swift_lib_dir="$SWIFT_TOOLCHAIN_DIR/usr/lib/swift/macosx"
+    env_vars+=("DYLD_LIBRARY_PATH=$swift_lib_dir")
+    # Define with USE_SWIFT_ prefix to make it pass through to the child processes
+    # even though those child executables are hardened runtime enabled.
+    env_vars+=("USE_SWIFT_DYLD_LIBRARY_PATH=$swift_lib_dir")
+  fi
+
+  env "${env_vars[@]}" "$@"
 }
 
 install-swift-sdk() {
-  local id="$1"
-  local triple="$2"
-  local url="$3"
-  swift experimental-sdk list | grep -q "$id" && return
-  info "Installing Swift SDK $id"
-  swift experimental-sdk install "$3"
+  local swift_version="$1"
+  local id="$2"
+  local triple="$3"
+  local url="$4"
+  execute-with-swift-toolchain-path "$swift_version" swift experimental-sdk list | grep -q "$id" && return
+  local install_command=(swift experimental-sdk install "$url")
+  info "Installing Swift SDK $id: ${install_command[*]}"
+  execute-with-swift-toolchain-path "$swift_version" "${install_command[@]}"
 }
 
 # Install Swift SDK from the ./swift-toolchain definition
 install-swift-sdk-from-manifest() {
-  local SWIFT_TOOLCHAIN_DIR=$(swift-toolchain-install-dir "$1")
+  local swift_version="$1"
   shift
-  local old_path="$PATH"
-  export PATH="$SWIFT_TOOLCHAIN_DIR/usr/bin:$PATH"
-  swift-sdk() { install-swift-sdk "$@"; }
+  swift-sdk() { install-swift-sdk "$swift_version" "$@"; }
   source "$SWIFT_TOOLCHAIN_MANIFEST"
-  export PATH="$old_path"
 }
 
 # Get Swift SDK id from the ./swift-toolchain definition
@@ -281,7 +304,6 @@ get-swift-sdk-id-from-manifest() {
 check-swift-version-file
 SWIFT_VERSION=$(cat $SWIFT_VERSION_FILE)
 install-swift-toolchain "$SWIFT_VERSION"
-update-latest-swift-toolchain "$SWIFT_VERSION"
 if [ -f "$SWIFT_TOOLCHAIN_MANIFEST" ]; then
   install-swift-sdk-from-manifest "$SWIFT_VERSION"
 fi
