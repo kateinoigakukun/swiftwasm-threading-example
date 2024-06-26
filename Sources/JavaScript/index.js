@@ -16,7 +16,8 @@ async function start() {
   if (!memoryImport.type) {
     throw new Error("Memory import type not found");
   }
-  const memory = new WebAssembly.Memory(memoryImport.type);
+  const memoryType = memoryImport.type;
+  const memory = new WebAssembly.Memory({ initial: memoryType.minimum, maximum: memoryType.maximum, shared: true });
   const wasiThreads = new WASIThreads({ module, memory });
   const { instance, swiftRuntime, wasi } = await instantiate({ module, wasiThreads });
   wasi.initialize(instance);

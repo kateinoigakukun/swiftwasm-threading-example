@@ -1,5 +1,5 @@
 {
-  "originHash" : "088dbdb44650e8c1ee65543fc4c0b6774a6c86f7714564e62bde2b09a87926e1",
+  "originHash" : "92987409b63f69582b1642f87b4ec31e3b868ea793ce9f778dfad8f2c3c08bf5",
   "pins" : [
     {
       "identity" : "chibi-ray",
@@ -7,14 +7,6 @@
       "location" : "https://github.com/kateinoigakukun/chibi-ray",
       "state" : {
         "revision" : "c8cab621a3338dd2f8e817d3785362409d3b8cf1"
-      }
-    },
-    {
-      "identity" : "javascriptkit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/swiftwasm/JavaScriptKit",
-      "state" : {
-        "revision" : "ea069824e205056292f6e50da995975477841432"
       }
     }
   ],
