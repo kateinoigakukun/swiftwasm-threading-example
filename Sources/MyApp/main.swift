@@ -26,6 +26,8 @@ public struct WebWorkerTaskExecutor {
             case idle = 0
             /// The worker is processing a job.
             case running = 1
+            /// The worker is terminated.
+            case terminated = 2
         }
         let state: Atomic<State> = Atomic(.running)
         let jobQueue: Mutex<[UnownedJob]> = Mutex([])
@@ -41,19 +43,18 @@ public struct WebWorkerTaskExecutor {
             // Wake up the worker to process a job.
             switch state.exchange(.running, ordering: .sequentiallyConsistent) {
             case .idle:
-                withUnsafePointer(to: state) { statePtr in
-                    let rawPointer = UnsafeRawPointer(statePtr).assumingMemoryBound(to: UInt32.self)
-                    _ = _swift_stdlib_wake(on: rawPointer, count: 1)
-                }
+                wake()
             case .running: break
+            case .terminated:
+                preconditionFailure("The worker is already terminated and cannot accept new jobs.")
             }
         }
 
         /// Run the worker loop.
         ///
-        /// NOTE: This function must be called from the worker thread, and it
-        ///       will never return.
-        func run(executor: WebWorkerTaskExecutor.Executor) -> Never {
+        /// NOTE: This function must be called from the worker thread.
+        /// It will return when the worker is terminated.
+        func run(executor: WebWorkerTaskExecutor.Executor) {
             while true {
                 let job = jobQueue.withLock { queue -> UnownedJob? in
                     return queue.popLast()
@@ -66,6 +67,7 @@ public struct WebWorkerTaskExecutor {
                     switch state.exchange(.idle, ordering: .sequentiallyConsistent) {
                     case .idle: continue // If it's already idle, continue the loop.
                     case .running: break
+                    case .terminated: return
                     }
                     withUnsafePointer(to: state) { statePtr in
                         let rawPointer = UnsafeRawPointer(statePtr).assumingMemoryBound(to: UInt32.self)
@@ -75,6 +77,28 @@ public struct WebWorkerTaskExecutor {
                         _ = _swift_stdlib_wait(on: rawPointer, expected: State.idle.rawValue, timeout: -1)
                     }
                 }
+            }
+        }
+
+        /// Terminate the worker.
+        func terminate() {
+            switch state.exchange(.terminated, ordering: .sequentiallyConsistent) {
+            case .idle:
+                // Wake up the `run` loop to terminate the worker.
+                wake()
+            case .running:
+                // The worker is running a job. It will terminate after the job is done.
+                break
+            case .terminated:
+                // The worker is already terminated.
+                return
+            }
+        }
+
+        private func wake() {
+            withUnsafePointer(to: state) { statePtr in
+                let rawPointer = UnsafeRawPointer(statePtr).assumingMemoryBound(to: UInt32.self)
+                _ = _swift_stdlib_wake(on: rawPointer, count: 1)
             }
         }
     }
@@ -95,15 +119,15 @@ public struct WebWorkerTaskExecutor {
         }
 
         func start() {
-            for worker in workers {
-                class Context: @unchecked Sendable {
-                    let executor: WebWorkerTaskExecutor.Executor
-                    let worker: Worker
-                    init(executor: WebWorkerTaskExecutor.Executor, worker: Worker) {
-                        self.executor = executor
-                        self.worker = worker
-                    }
+            class Context: @unchecked Sendable {
+                let executor: WebWorkerTaskExecutor.Executor
+                let worker: Worker
+                init(executor: WebWorkerTaskExecutor.Executor, worker: Worker) {
+                    self.executor = executor
+                    self.worker = worker
                 }
+            }
+            for worker in workers {
                 // NOTE: The context must be allocated on the heap because
                 // `pthread_create` on WASI does not guarantee the thread is started
                 // immediately. The context must be retained until the thread is started.
@@ -112,12 +136,19 @@ public struct WebWorkerTaskExecutor {
                 let ret = pthread_create(nil, nil, { ptr in
                     let context = Unmanaged<Context>.fromOpaque(ptr!).takeRetainedValue()
                     context.worker.run(executor: context.executor)
+                    return nil
                 }, ptr)
                 precondition(ret == 0, "Failed to create a thread")
             }
         }
 
-        public func enqueue(_ job: consuming ExecutorJob) {
+        func terminate() {
+            for worker in workers {
+                worker.terminate()
+            }
+        }
+
+        func enqueue(_ job: consuming ExecutorJob) {
             let job = UnownedJob(job)
             roundRobinIndex.withLock { index in
                 let worker = workers[index]
@@ -133,8 +164,14 @@ public struct WebWorkerTaskExecutor {
         self.executor = Executor(numberOfThreads: numberOfThreads)
     }
 
+    /// Start child Web Worker threads.
     public func start() {
         executor.start()
+    }
+
+    /// Terminate child Web Worker threads.
+    public func terminate() {
+        executor.terminate()
     }
 
     private static var swift_task_enqueueGlobal_hook_original: UnsafeMutableRawPointer?
@@ -283,7 +320,7 @@ func main() {
             let executor = WebWorkerTaskExecutor(numberOfThreads: concurrency)
             executor.start()
             await render(scene: scene, ctx: ctx, renderTime: renderTime, concurrency: concurrency, executor: executor)
-            withExtendedLifetime(executor) { }
+            executor.terminate()
             print("Render done")
         }
         return JSValue.undefined
