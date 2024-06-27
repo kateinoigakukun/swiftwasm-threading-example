@@ -1,6 +1,6 @@
 import JavaScriptKit
 import JavaScriptEventLoop
-import _CJavaScriptEventLoop
+@preconcurrency import _CJavaScriptEventLoop
 import Synchronization
 import wasi_pthread
 
@@ -192,32 +192,40 @@ public struct WebWorkerTaskExecutor {
 
     private static let currentInstallation: Mutex<Installation?> = Mutex(nil)
 
-    public func withGlobalExecutor<T>(
-        _ body: () async throws -> T,
-        file: StaticString = #fileID, line: UInt = #line
-    ) async rethrows -> T {
-        WebWorkerTaskExecutor.currentInstallation.withLock { installation in
+    private func installHookIfNeeded(file: StaticString, line: UInt) -> Bool {
+        let needGlobalExecutorHook = WebWorkerTaskExecutor.currentInstallation.withLock { installation in
             if let installation = installation {
                 fatalError("""
                     WebWorkerTaskExecutor.withGlobalExecutor cannot be nested. \
                     It was already installed at \(installation.file):\(installation.line).
                 """)
             }
-        }
 
-        typealias swift_task_enqueueGlobal_hook_Fn = @convention(thin) (UnownedJob, swift_task_enqueueGlobal_original) -> Void
-        return try await withUnsafeCurrentTask { installedTask in
-            // If the task doesn't have a parent preferred task executor, hook
-            // the global executor to get back to the main thread.
-            let needGlobalExecutorHook = installedTask?.unownedTaskExecutor == nil
-            return try await withTaskExecutorPreference(self.executor) {
-                let installation = Installation(
+            return withUnsafeCurrentTask { installingTask in
+                let newInstallation = Installation(
                     swift_task_enqueueGlobal_hook_original: swift_task_enqueueGlobal_hook,
-                    task: installedTask,
+                    task: installingTask,
                     file: file,
                     line: line
                 )
-                WebWorkerTaskExecutor.currentInstallation.withLock { $0 = installation }
+                installation = newInstallation
+                // If the task doesn't have a parent preferred task executor, hook
+                // the global executor to get back to the main thread.
+                return installingTask?.unownedTaskExecutor == nil
+            }
+        }
+        return needGlobalExecutorHook
+    }
+
+    public nonisolated(unsafe) func withGlobalExecutor<T>(
+        _ body: () async throws -> T,
+        file: StaticString = #fileID, line: UInt = #line
+    ) async rethrows -> T {
+        let needGlobalExecutorHook = installHookIfNeeded(file: file, line: line)
+
+        typealias swift_task_enqueueGlobal_hook_Fn = @convention(thin) (UnownedJob, swift_task_enqueueGlobal_original) -> Void
+        return try await withUnsafeCurrentTask { installedTask in
+            return try await withTaskExecutorPreference(self.executor) {
                 if needGlobalExecutorHook {
                     let swift_task_enqueueGlobal_hook_impl: swift_task_enqueueGlobal_hook_Fn = { job, _ in
                         WebWorkerTaskExecutor.currentInstallation.withLock { installation in

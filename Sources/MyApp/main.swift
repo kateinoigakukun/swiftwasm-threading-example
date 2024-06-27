@@ -1,5 +1,5 @@
-import ChibiRay
-import JavaScriptKit
+@preconcurrency import ChibiRay
+@preconcurrency import JavaScriptKit
 import JavaScriptEventLoop
 
 JavaScriptEventLoop.installGlobalExecutor()
@@ -21,7 +21,7 @@ func renderInCanvas(ctx: JSObject, image: ImageView) {
     _ = ctx.putImageData!(imageData, 0, 0)
 }
 
-struct ImageView {
+struct ImageView: @unchecked Sendable {
     let width, height: Int
     let buffer: UnsafeMutableBufferPointer<Color>
 
@@ -35,7 +35,7 @@ struct ImageView {
     }
 }
 
-struct Work {
+struct Work: Sendable {
     let scene: Scene
     let imageView: ImageView
     let yRange: CountableRange<Int>

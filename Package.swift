@@ -17,6 +17,5 @@ let package = Package(
                 .product(name: "ChibiRay", package: "chibi-ray"),
             ]
         ),
-    ],
-    swiftLanguageVersions: [.v5]
+    ]
 )
