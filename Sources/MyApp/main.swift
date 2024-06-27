@@ -7,20 +7,53 @@ import _CJavaScriptEventLoop
 
 JavaScriptEventLoop.installGlobalExecutor()
 
-public final class WebWorkerTaskExecutor: TaskExecutor {
+@_extern(c, "llvm.wasm.memory.atomic.notify")
+internal func _swift_stdlib_wake(on: UnsafePointer<UInt32>, count: UInt32) -> UInt32
 
+@_extern(c, "llvm.wasm.memory.atomic.wait32")
+internal func _swift_stdlib_wait(
+  on: UnsafePointer<UInt32>,
+  expected: UInt32,
+  timeout: Int64
+) -> UInt32
+
+public struct WebWorkerTaskExecutor {
+
+    /// A job worker dedicated to a single Web Worker thread.
     private final class Worker: Sendable {
+        enum State: UInt32, AtomicRepresentable {
+            /// The worker is idle and waiting for a new job.
+            case idle = 0
+            /// The worker is processing a job.
+            case running = 1
+        }
+        let state: Atomic<State> = Atomic(.running)
         let jobQueue: Mutex<[UnownedJob]> = Mutex([])
 
         init() {}
 
+        /// Enqueue a job to the worker.
         func enqueue(_ job: UnownedJob) {
             jobQueue.withLock { queue in
                 queue.append(job)
             }
+
+            // Wake up the worker to process a job.
+            switch state.exchange(.running, ordering: .sequentiallyConsistent) {
+            case .idle:
+                withUnsafePointer(to: state) { statePtr in
+                    let rawPointer = UnsafeRawPointer(statePtr).assumingMemoryBound(to: UInt32.self)
+                    _ = _swift_stdlib_wake(on: rawPointer, count: 1)
+                }
+            case .running: break
+            }
         }
 
-        func run(executor: WebWorkerTaskExecutor) {
+        /// Run the worker loop.
+        ///
+        /// NOTE: This function must be called from the worker thread, and it
+        ///       will never return.
+        func run(executor: WebWorkerTaskExecutor.Executor) -> Never {
             while true {
                 let job = jobQueue.withLock { queue -> UnownedJob? in
                     return queue.popLast()
@@ -29,55 +62,79 @@ public final class WebWorkerTaskExecutor: TaskExecutor {
                     job.runSynchronously(
                         on: executor.asUnownedTaskExecutor()
                     )
+                } else {
+                    switch state.exchange(.idle, ordering: .sequentiallyConsistent) {
+                    case .idle: continue // If it's already idle, continue the loop.
+                    case .running: break
+                    }
+                    withUnsafePointer(to: state) { statePtr in
+                        let rawPointer = UnsafeRawPointer(statePtr).assumingMemoryBound(to: UInt32.self)
+                        // Wait for a new job to be enqueued.
+                        // If a new job has been enqueued since the last pop check, it will wake up immediately.
+                        // Otherwise, it will wait until a new job is enqueued.
+                        _ = _swift_stdlib_wait(on: rawPointer, expected: State.idle.rawValue, timeout: -1)
+                    }
                 }
             }
         }
     }
 
-    private let numberOfThreads: Int
-    private let workers: [Worker]
-    private let roundRobinIndex: Mutex<Int> = Mutex(0)
+    private final class Executor: TaskExecutor {
+        private let numberOfThreads: Int
+        private let workers: [Worker]
+        private let roundRobinIndex: Mutex<Int> = Mutex(0)
+
+        init(numberOfThreads: Int) {
+            self.numberOfThreads = numberOfThreads
+            var workers = [Worker]()
+            for _ in 0..<numberOfThreads {
+                let worker = Worker()
+                workers.append(worker)
+            }
+            self.workers = workers
+        }
+
+        func start() {
+            for worker in workers {
+                class Context: @unchecked Sendable {
+                    let executor: WebWorkerTaskExecutor.Executor
+                    let worker: Worker
+                    init(executor: WebWorkerTaskExecutor.Executor, worker: Worker) {
+                        self.executor = executor
+                        self.worker = worker
+                    }
+                }
+                // NOTE: The context must be allocated on the heap because
+                // `pthread_create` on WASI does not guarantee the thread is started
+                // immediately. The context must be retained until the thread is started.
+                let context = Context(executor: self, worker: worker)
+                let ptr = Unmanaged.passRetained(context).toOpaque()
+                let ret = pthread_create(nil, nil, { ptr in
+                    let context = Unmanaged<Context>.fromOpaque(ptr!).takeRetainedValue()
+                    context.worker.run(executor: context.executor)
+                }, ptr)
+                precondition(ret == 0, "Failed to create a thread")
+            }
+        }
+
+        public func enqueue(_ job: consuming ExecutorJob) {
+            let job = UnownedJob(job)
+            roundRobinIndex.withLock { index in
+                let worker = workers[index]
+                worker.enqueue(job)
+                index = (index + 1) % numberOfThreads
+            }
+        }
+    }
+
+    private let executor: Executor
 
     public init(numberOfThreads: Int) {
-        self.numberOfThreads = numberOfThreads
-        var workers = [Worker]()
-        for _ in 0..<numberOfThreads {
-            let worker = Worker()
-            workers.append(worker)
-        }
-        self.workers = workers
+        self.executor = Executor(numberOfThreads: numberOfThreads)
     }
 
     public func start() {
-        for worker in workers {
-            class Context: Sendable {
-                let executor: WebWorkerTaskExecutor
-                let worker: Worker
-                init(executor: WebWorkerTaskExecutor, worker: Worker) {
-                    self.executor = executor
-                    self.worker = worker
-                }
-            }
-            // NOTE: The context must be allocated on the heap because
-            // `pthread_create` on WASI does not guarantee the thread is started
-            // immediately. The context must be retained until the thread is started.
-            let context = Context(executor: self, worker: worker)
-            let ptr = Unmanaged.passRetained(context).toOpaque()
-            let ret = pthread_create(nil, nil, { ptr in
-                let context = Unmanaged<Context>.fromOpaque(ptr!).takeRetainedValue()
-                context.worker.run(executor: context.executor)
-                return nil
-            }, ptr)
-            precondition(ret == 0, "Failed to create a thread")
-        }
-    }
-
-    public func enqueue(_ job: consuming ExecutorJob) {
-        let job = UnownedJob(job)
-        roundRobinIndex.withLock { index in
-            workers[index].enqueue(job)
-            index = (index + 1) % numberOfThreads
-        }
+        executor.start()
     }
 
     private static var swift_task_enqueueGlobal_hook_original: UnsafeMutableRawPointer?
@@ -87,23 +144,20 @@ public final class WebWorkerTaskExecutor: TaskExecutor {
         let needGlobalExecutorHook = withUnsafeCurrentTask { task in
             // If the task doesn't have a parent preferred task executor, hook
             // the global executor to get back to the main thread.
-            return task?.unownedTaskExecutor == nil
+            return task?.unownedTaskExecutor == nil && WebWorkerTaskExecutor.swift_task_enqueueGlobal_hook_original == nil
         }
 
-        return try await withTaskExecutorPreference(self) {
+        return try await withTaskExecutorPreference(self.executor) {
             if needGlobalExecutorHook {
-                print("Hooking the global executor to get back to the main thread")
                 WebWorkerTaskExecutor.swift_task_enqueueGlobal_hook_original = swift_task_enqueueGlobal_hook
                 let swift_task_enqueueGlobal_hook_impl: swift_task_enqueueGlobal_hook_Fn = { job, _ in
-                    let hasPreferredTaskExecutor = withUnsafeCurrentTask { task in
-                        // If the task doesn't have a parent preferred task executor, hook
-                        // the global executor to get back to the main thread.
-                        return task?.unownedTaskExecutor == nil
-                    }
-                    print("hasPreferredTaskExecutor: \(hasPreferredTaskExecutor)")
+                    // Once we reached the end of the `withTaskExecutorPreference` block,
+                    // the next continuation job will be enqueued to the global executor here.
+
+                    // Write back the original hook
                     swift_task_enqueueGlobal_hook = WebWorkerTaskExecutor.swift_task_enqueueGlobal_hook_original
                     WebWorkerTaskExecutor.swift_task_enqueueGlobal_hook_original = nil
-                    print("Enqueueing a global job back to the main thread")
+                    // Enqueue the job to the main thread instead of the current thread.
                     JavaScriptEventLoop.enqueueMainJob(ExecutorJob(job))
                 }
                 swift_task_enqueueGlobal_hook = unsafeBitCast(swift_task_enqueueGlobal_hook_impl, to: UnsafeMutableRawPointer?.self)
@@ -149,11 +203,10 @@ struct ImageView {
     }
 }
 
-class Work {
+struct Work {
     let scene: Scene
     let imageView: ImageView
     let yRange: CountableRange<Int>
-    var done: Bool = false
 
     init(scene: Scene, imageView: ImageView, yRange: CountableRange<Int>) {
         self.scene = scene
@@ -168,7 +221,6 @@ class Work {
                 imageView[x, y] = color
             }
         }
-        done = true
     }
 }
 
@@ -181,19 +233,6 @@ func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int,
 
     let clock = ContinuousClock()
     let start = clock.now
-    var works = [Work]()
-
-    let yStride = scene.height / concurrency
-    for i in 0..<concurrency {
-        let yRange = i * yStride..<(i + 1) * yStride
-        let work = Work(scene: scene, imageView: imageView, yRange: yRange)
-        works.append(work)
-    }
-    // Remaining rows
-    if scene.height % concurrency != 0 {
-        let work = Work(scene: scene, imageView: imageView, yRange: (concurrency * yStride)..<scene.height)
-        works.append(work)
-    }
 
     var checkTimer: JSValue?
     checkTimer = JSObject.global.setInterval!(JSClosure { _ in
@@ -201,65 +240,30 @@ func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int,
         renderInCanvas(ctx: ctx, image: imageView)
         let renderSceneDuration = clock.now - start
         renderTime.textContent = .string("Render time: \(renderSceneDuration)")
-
-        let numberOfDoneWorks = works.filter { $0.done }.count
-        if numberOfDoneWorks == works.count {
-            print("All threads are done")
-            _ = JSObject.global.clearInterval!(checkTimer!)
-            checkTimer = nil
-            imageBuffer.deallocate()
-        } else {
-            print("Some threads are still working (\(numberOfDoneWorks)/\(works.count))")
-        }
         return .undefined
     }, 250)
 
-    // await withTaskExecutorPreference(executor) {
     await executor.withGlobalExecutor {
         await withTaskGroup(of: Void.self) { group in
-            for work in works {
-                group.addTask {
-                    work.run()
-                }
+            let yStride = scene.height / concurrency
+            for i in 0..<concurrency {
+                let yRange = i * yStride..<(i + 1) * yStride
+                let work = Work(scene: scene, imageView: imageView, yRange: yRange)
+                group.addTask { work.run() }
             }
-
-            for await _ in group {
-                print("Work done")
+            // Remaining rows
+            if scene.height % concurrency != 0 {
+                let work = Work(scene: scene, imageView: imageView, yRange: (concurrency * yStride)..<scene.height)
+                group.addTask { work.run() }
             }
         }
-        // await _MainActor.run {
-        //     print("Am I on the main thread?")
-        // }
     }
+    _ = JSObject.global.clearInterval!(checkTimer!)
+    checkTimer = nil
+
+    renderInCanvas(ctx: ctx, image: imageView)
+    imageBuffer.deallocate()
     print("All work done")
-}
-
-func getStackTrace(demangle: Bool = true) -> [String] {
-    let stack = JSObject.global.eval!("new Error().stack").string!
-    let lines: [Substring] = stack.split(separator: "\n")
-    if !demangle {
-        return lines.map { String($0) }
-    }
-    return lines.map { line -> String in
-        let pattern = #/    at (\$s.+) (.+)/#
-        guard let match = line.firstMatch(of: pattern) else {
-            return String(line)
-        }
-        var mangledName = match.output.1
-        let demangled = mangledName.withUTF8 { buffer -> String? in
-            @_extern(c, "swift_demangle")
-            func swift_demangle(
-                _ mangledName: UnsafePointer<UInt8>, _ mangledNameLength: Int,
-                _ outputBuffer: UnsafeMutablePointer<Int8>?, _ outputBufferSize: UnsafeMutablePointer<Int>?,
-                _ flags: UInt32
-            ) -> UnsafePointer<Int8>?
-            guard let cString = swift_demangle(buffer.baseAddress!, buffer.count, nil, nil, 0) else {
-                return nil
-            }
-            return String(cString: cString)
-        }
-        return "    at " + (demangled ?? String(mangledName)) + " " + match.output.2
-    }
 }
 
 func main() {
@@ -271,7 +275,6 @@ func main() {
     let scene = createDemoScene()
     canvas.width  = .number(Double(scene.width))
     canvas.height = .number(Double(scene.height))
-    print(getStackTrace().joined(separator: "\n"))
 
     _ = renderButton.addEventListener!("click", JSClosure { _ in
         Task {
