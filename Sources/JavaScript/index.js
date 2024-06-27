@@ -19,9 +19,7 @@ async function start() {
   const memoryType = memoryImport.type;
   const memory = new WebAssembly.Memory({ initial: memoryType.minimum, maximum: memoryType.maximum, shared: true });
   const onMessageFromWorker = (tid, event) => {
-    console.log(`Received message from worker ${tid}:`, event.data);
-    console.log(instance);
-    instance.exports.swjs_enqueue_main_job(event.data);
+    instance.exports.swjs_enqueue_main_job_from_worker(event.data);
   };
   const wasiThreads = new WASIThreads({ module, memory, onMessage: onMessageFromWorker });
   const { instance, swiftRuntime, wasi } = await instantiate({ module, wasiThreads });
