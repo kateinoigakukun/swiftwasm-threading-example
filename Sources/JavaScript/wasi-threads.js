@@ -1,8 +1,9 @@
 export class WASIThreads {
     constructor(options) {
-        const { module, memory } = options;
+        const { module, memory, onMessage } = options;
         this.memory = memory;
         this.module = module;
+        this.onMessage = onMessage;
         this.tidSymbol = Symbol("tid");
         this.nextTid = 1;
     }
@@ -22,6 +23,9 @@ export class WASIThreads {
         const tid = this.nextTid;
         this.nextTid += 1;
         Object.defineProperty(worker, this.tidSymbol, { value: tid });
+        worker.addEventListener("message", (event) => {
+            this.onMessage(tid, event);
+        });
         worker.postMessage({ module: this.module, memory: this.memory, tid, startArg })
         return tid;
     }

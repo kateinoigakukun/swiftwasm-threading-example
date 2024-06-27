@@ -3,6 +3,7 @@ import ChibiRay
 import JavaScriptKit
 import Synchronization
 import JavaScriptEventLoop
+import _CJavaScriptEventLoop
 
 JavaScriptEventLoop.installGlobalExecutor()
 
@@ -25,7 +26,9 @@ public final class WebWorkerTaskExecutor: TaskExecutor {
                     return queue.popLast()
                 }
                 if let job = job {
-                    job.runSynchronously(on: executor.asUnownedTaskExecutor())
+                    job.runSynchronously(
+                        on: executor.asUnownedTaskExecutor()
+                    )
                 }
             }
         }
@@ -55,15 +58,17 @@ public final class WebWorkerTaskExecutor: TaskExecutor {
                     self.worker = worker
                 }
             }
+            // NOTE: The context must be allocated on the heap because
+            // `pthread_create` on WASI does not guarantee the thread is started
+            // immediately. The context must be retained until the thread is started.
             let context = Context(executor: self, worker: worker)
             let ptr = Unmanaged.passRetained(context).toOpaque()
-                let ret = pthread_create(nil, nil, { ptr in
-                    // let context = ptr.unsafelyUnwrapped.assumingMemoryBound(to: Context.self).pointee
-                    let context = Unmanaged<Context>.fromOpaque(ptr!).takeRetainedValue()
-                    context.worker.run(executor: context.executor)
-                    return nil
-                }, ptr)
-                precondition(ret == 0, "Failed to create a thread")
+            let ret = pthread_create(nil, nil, { ptr in
+                let context = Unmanaged<Context>.fromOpaque(ptr!).takeRetainedValue()
+                context.worker.run(executor: context.executor)
+                return nil
+            }, ptr)
+            precondition(ret == 0, "Failed to create a thread")
         }
     }
 
@@ -74,6 +79,43 @@ public final class WebWorkerTaskExecutor: TaskExecutor {
             index = (index + 1) % numberOfThreads
         }
     }
+
+    private static var swift_task_enqueueGlobal_hook_original: UnsafeMutableRawPointer?
+
+    public func withGlobalExecutor<T>(_ body: () async throws -> T) async rethrows -> T {
+        typealias swift_task_enqueueGlobal_hook_Fn = @convention(thin) (UnownedJob, swift_task_enqueueGlobal_original) -> Void
+        let needGlobalExecutorHook = withUnsafeCurrentTask { task in
+            // If the task doesn't have a parent preferred task executor, hook
+            // the global executor to get back to the main thread.
+            return task?.unownedTaskExecutor == nil
+        }
+
+        return try await withTaskExecutorPreference(self) {
+            if needGlobalExecutorHook {
+                print("Hooking the global executor to get back to the main thread")
+                WebWorkerTaskExecutor.swift_task_enqueueGlobal_hook_original = swift_task_enqueueGlobal_hook
+                let swift_task_enqueueGlobal_hook_impl: swift_task_enqueueGlobal_hook_Fn = { job, _ in
+                    let hasPreferredTaskExecutor = withUnsafeCurrentTask { task in
+                        // If the task doesn't have a parent preferred task executor, hook
+                        // the global executor to get back to the main thread.
+                        return task?.unownedTaskExecutor == nil
+                    }
+                    print("hasPreferredTaskExecutor: \(hasPreferredTaskExecutor)")
+                    swift_task_enqueueGlobal_hook = WebWorkerTaskExecutor.swift_task_enqueueGlobal_hook_original
+                    WebWorkerTaskExecutor.swift_task_enqueueGlobal_hook_original = nil
+                    print("Enqueueing a global job back to the main thread")
+                    JavaScriptEventLoop.enqueueMainJob(ExecutorJob(job))
+                }
+                swift_task_enqueueGlobal_hook = unsafeBitCast(swift_task_enqueueGlobal_hook_impl, to: UnsafeMutableRawPointer?.self)
+            }
+            return try await body()
+        }
+    }
+}
+
+@_expose(wasm, "swjs_enqueue_main_job")
+func swjs_enqueue_main_job(_ job: UnownedJob) {
+    JavaScriptEventLoop.shared.enqueue(ExecutorJob(job))
 }
 
 func renderInCanvas(ctx: JSObject, image: ImageView) {
@@ -130,7 +172,7 @@ class Work {
     }
 }
 
-func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int, executor: some TaskExecutor) async {
+func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int, executor: WebWorkerTaskExecutor) async {
 
     let imageBuffer = UnsafeMutableBufferPointer<Color>.allocate(capacity: scene.width * scene.height)
     // Initialize the buffer with black color
@@ -172,7 +214,8 @@ func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int,
         return .undefined
     }, 250)
 
-    await withTaskExecutorPreference(executor) {
+    // await withTaskExecutorPreference(executor) {
+    await executor.withGlobalExecutor {
         await withTaskGroup(of: Void.self) { group in
             for work in works {
                 group.addTask {
@@ -184,18 +227,39 @@ func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int,
                 print("Work done")
             }
         }
+        // await _MainActor.run {
+        //     print("Am I on the main thread?")
+        // }
     }
     print("All work done")
-    // var thread = pthread_t(bitPattern: 0)
-    // for work in works {
-    //     let ret = pthread_create(&thread, nil, { ctx in
-    //         print("Started thread work")
-    //         let work = Unmanaged<Work>.fromOpaque(ctx!).takeUnretainedValue()
-    //         work.run()
-    //         return nil
-    //     }, Unmanaged.passRetained(work).toOpaque())
-    //     print("pthread_create: \(ret)")
-    // }
+}
+
+func getStackTrace(demangle: Bool = true) -> [String] {
+    let stack = JSObject.global.eval!("new Error().stack").string!
+    let lines: [Substring] = stack.split(separator: "\n")
+    if !demangle {
+        return lines.map { String($0) }
+    }
+    return lines.map { line -> String in
+        let pattern = #/    at (\$s.+) (.+)/#
+        guard let match = line.firstMatch(of: pattern) else {
+            return String(line)
+        }
+        var mangledName = match.output.1
+        let demangled = mangledName.withUTF8 { buffer -> String? in
+            @_extern(c, "swift_demangle")
+            func swift_demangle(
+                _ mangledName: UnsafePointer<UInt8>, _ mangledNameLength: Int,
+                _ outputBuffer: UnsafeMutablePointer<Int8>?, _ outputBufferSize: UnsafeMutablePointer<Int>?,
+                _ flags: UInt32
+            ) -> UnsafePointer<Int8>?
+            guard let cString = swift_demangle(buffer.baseAddress!, buffer.count, nil, nil, 0) else {
+                return nil
+            }
+            return String(cString: cString)
+        }
+        return "    at " + (demangled ?? String(mangledName)) + " " + match.output.2
+    }
 }
 
 func main() {
@@ -207,9 +271,10 @@ func main() {
     let scene = createDemoScene()
     canvas.width  = .number(Double(scene.width))
     canvas.height = .number(Double(scene.height))
+    print(getStackTrace().joined(separator: "\n"))
 
     _ = renderButton.addEventListener!("click", JSClosure { _ in
-        Task { @MainActor in
+        Task {
             let concurrency = max(Int(concurrency.value.string!) ?? 1, 1)
             let ctx = canvas.getContext!("2d").object!
             let executor = WebWorkerTaskExecutor(numberOfThreads: concurrency)
