@@ -16,14 +16,14 @@ class ThreadRegistry {
     return tid;
   }
 
-  listenMainJobFromWorkerThread(tid, listener) {
+  listenMessageFromWorkerThread(tid, listener) {
     const worker = this.workers.get(tid);
     worker.onmessage = (event) => {
       listener(event.data);
     };
   }
 
-  wakeUpWorkerThread(tid, data) {
+  postMessageToWorkerThread(tid, data) {
     const worker = this.workers.get(tid);
     worker.postMessage(data);
   }

@@ -1,5 +1,5 @@
 {
-  "originHash" : "9816254c4636cb8ecade083b7cabf6d8a59ce72845f76c3c5b714808e5f7ba08",
+  "originHash" : "3c9b668e3bbeffc2ba91f1e418db03bff0ce7c9cd830546989d1cb6041241f24",
   "pins" : [
     {
       "identity" : "chibi-ray",
@@ -14,7 +14,7 @@
       "kind" : "remoteSourceControl",
       "location" : "https://github.com/swiftwasm/JavaScriptKit",
       "state" : {
-        "revision" : "358633c07f7833a2745587458845efa698c38ba8"
+        "revision" : "a4daecdede926f532cd7edfddb068ede1b6e26f2"
       }
     }
   ],
