@@ -5,8 +5,7 @@ import PackageDescription
 let package = Package(
     name: "Example",
     dependencies: [
-        // .package(url: "https://github.com/swiftwasm/JavaScriptKit", branch: "yt/web-worker-executor"),
-        .package(path: "../../swiftwasm/JavaScriptKit"),
+        .package(url: "https://github.com/swiftwasm/JavaScriptKit", revision: "358633c07f7833a2745587458845efa698c38ba8"), // branch: "yt/web-worker-executor"
         .package(url: "https://github.com/kateinoigakukun/chibi-ray", revision: "c8cab621a3338dd2f8e817d3785362409d3b8cf1"),
     ],
     targets: [

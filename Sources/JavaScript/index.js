@@ -27,6 +27,12 @@ class ThreadRegistry {
     const worker = this.workers.get(tid);
     worker.postMessage(data);
   }
+
+  terminateWorkerThread(tid) {
+    const worker = this.workers.get(tid);
+    worker.terminate();
+    this.workers.delete(tid);
+  }
 }
 
 async function start() {
