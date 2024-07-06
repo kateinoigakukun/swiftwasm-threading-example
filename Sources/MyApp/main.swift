@@ -3,6 +3,7 @@
 import JavaScriptEventLoop
 
 JavaScriptEventLoop.installGlobalExecutor()
+WebWorkerTaskExecutor.installGlobalExecutor()
 
 func renderInCanvas(ctx: JSObject, image: ImageView) {
     let imageData = ctx.createImageData!(image.width, image.height).object!
@@ -75,21 +76,20 @@ func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int,
         return .undefined
     }, 250)
 
-    await executor.withGlobalExecutor {
-        await withTaskGroup(of: Void.self) { group in
-            let yStride = scene.height / concurrency
-            for i in 0..<concurrency {
-                let yRange = i * yStride..<(i + 1) * yStride
-                let work = Work(scene: scene, imageView: imageView, yRange: yRange)
-                group.addTask { work.run() }
-            }
-            // Remaining rows
-            if scene.height % concurrency != 0 {
-                let work = Work(scene: scene, imageView: imageView, yRange: (concurrency * yStride)..<scene.height)
-                group.addTask { work.run() }
-            }
+    await withTaskGroup(of: Void.self) { group in
+        let yStride = scene.height / concurrency
+        for i in 0..<concurrency {
+            let yRange = i * yStride..<(i + 1) * yStride
+            let work = Work(scene: scene, imageView: imageView, yRange: yRange)
+            group.addTask(executorPreference: executor) { work.run() }
+        }
+        // Remaining rows
+        if scene.height % concurrency != 0 {
+            let work = Work(scene: scene, imageView: imageView, yRange: (concurrency * yStride)..<scene.height)
+            group.addTask(executorPreference: executor) { work.run() }
         }
     }
+
     _ = JSObject.global.clearInterval!(checkTimer!)
     checkTimer = nil
 
@@ -98,7 +98,7 @@ func render(scene: Scene, ctx: JSObject, renderTime: JSObject, concurrency: Int,
     print("All work done")
 }
 
-func main() {
+func main() async throws {
     let canvas = JSObject.global.document.getElementById("canvas").object!
     let renderButton = JSObject.global.document.getElementById("render-button").object!
     let renderTime = JSObject.global.document.getElementById("render-time").object!
@@ -112,8 +112,7 @@ func main() {
         Task {
             let concurrency = max(Int(concurrency.value.string!) ?? 1, 1)
             let ctx = canvas.getContext!("2d").object!
-            let executor = WebWorkerTaskExecutor(numberOfThreads: concurrency)
-            executor.start()
+            let executor = try await WebWorkerTaskExecutor(numberOfThreads: concurrency)
             await render(scene: scene, ctx: ctx, renderTime: renderTime, concurrency: concurrency, executor: executor)
             executor.terminate()
             print("Render done")
@@ -122,4 +121,6 @@ func main() {
     })
 }
 
-main()
+Task {
+    try await main()
+}
